@@ -1,0 +1,55 @@
+
+name: ci-terraform
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ 'terraform/**', 'envs/**', '.github/workflows/**' ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_CLI_ARGS_init: -upgrade
+  TF_IN_AUTOMATION: 1
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init -reconfigure -backend-config="key=dev.tfstate"
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: terraform plan -var-file="../envs/dev/terraform.tfvars" -out=tfplan
+
+      - name: Terraform Apply (main only)
+        if: github.ref == 'refs/heads/main'
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
