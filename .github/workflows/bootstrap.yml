@@ -1,0 +1,131 @@
+name: bootstrap (once-per-env)
+
+on:
+  workflow_dispatch:
+    inputs:
+      subscription_id:
+        description: "Azure Subscription ID (GUID)"
+        required: true
+      location:
+        description: "Azure region"
+        required: true
+        default: "eastus"
+      infra_rg:
+        description: "Infra Resource Group (ACR/App Service)"
+        required: true
+        default: "rg-azure-observability"
+      tfstate_rg:
+        description: "Terraform State Resource Group"
+        required: true
+        default: "rg-tfstate-azure-observability"
+      tfstate_sa:
+        description: "Terraform State Storage Account (lowercase, unique, 3-24 chars)"
+        required: true
+        default: "azureobservabilitytfstate1234"
+      tfstate_container:
+        description: "Terraform State Blob Container"
+        required: true
+        default: "tfstate"
+      sp_name:
+        description: "Display name for CI Service Principal"
+        required: true
+        default: "gh-ci-tf"
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (bootstrap SP)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_BOOTSTRAP_CREDENTIALS }}
+
+      - name: Set subscription
+        run: az account set --subscription "${{ github.event.inputs.subscription_id }}"
+
+      - name: Ensure resource groups
+        shell: bash
+        run: |
+          set -euo pipefail
+          az group create -n "${{ github.event.inputs.infra_rg }}"   -l "${{ github.event.inputs.location }}"
+          az group create -n "${{ github.event.inputs.tfstate_rg }}" -l "${{ github.event.inputs.location }}"
+
+      - name: Ensure tfstate storage account
+        id: sa
+        shell: bash
+        run: |
+          set -euo pipefail
+          SA="${{ github.event.inputs.tfstate_sa }}"
+          RG="${{ github.event.inputs.tfstate_rg }}"
+          LOC="${{ github.event.inputs.location }}"
+          if ! az storage account show -n "$SA" -g "$RG" >/dev/null 2>&1; then
+            az storage account create -n "$SA" -g "$RG" -l "$LOC" --sku Standard_LRS --encryption-services blob
+          fi
+          echo "sa=$SA" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure tfstate container
+        shell: bash
+        run: |
+          set -euo pipefail
+          az storage container create \
+            --name "${{ github.event.inputs.tfstate_container }}" \
+            --account-name "${{ steps.sa.outputs.sa }}" \
+            --auth-mode login \
+            --public-access off
+
+      - name: Create or rotate CI Service Principal (Contributor on both RGs)
+        id: sp
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUB="${{ github.event.inputs.subscription_id }}"
+          INFRA_RG="${{ github.event.inputs.infra_rg }}"
+          TFSTATE_RG="${{ github.event.inputs.tfstate_rg }}"
+          SP_NAME="${{ github.event.inputs.sp_name }}"
+          APPID="$(az ad sp list --display-name "$SP_NAME" --query "[0].appId" -o tsv || true)"
+          if [ -z "$APPID" ] || [ "$APPID" = "None" ]; then
+            az ad sp create-for-rbac \
+              --name "$SP_NAME" \
+              --role Contributor \
+              --scopes "/subscriptions/$SUB/resourceGroups/$INFRA_RG" "/subscriptions/$SUB/resourceGroups/$TFSTATE_RG" \
+              --sdk-auth > ci_sp.json
+          else
+            az ad sp credential reset \
+              --name "$APPID" \
+              --credential-description "gh-ci-token" \
+              --years 2 \
+              --sdk-auth > ci_sp.json
+          fi
+          TENANT_ID="$(az account show --query tenantId -o tsv)"
+          {
+            printf "TFSTATE_RG=%s\n"       "${{ github.event.inputs.tfstate_rg }}"
+            printf "TFSTATE_SA=%s\n"       "${{ steps.sa.outputs.sa }}"
+            printf "TFSTATE_CONTAINER=%s\n" "${{ github.event.inputs.tfstate_container }}"
+            printf "TFSTATE_KEY=%s\n"      "energy-advisor.tfstate"
+            printf "INFRA_RG=%s\n"         "${{ github.event.inputs.infra_rg }}"
+            printf "LOCATION=%s\n"         "${{ github.event.inputs.location }}"
+            printf "AZ_SUBSCRIPTION_ID=%s\n" "$SUB"
+            printf "AZ_TENANT_ID=%s\n"       "$TENANT_ID"
+          } > backend-vars.txt
+
+      - name: Upload bootstrap outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-outputs
+          path: |
+            ci_sp.json
+            backend-vars.txt
+
+      - name: Next steps
+        shell: bash
+        run: |
+          echo "Bootstrap finished."
+          echo "Download artifact 'bootstrap-outputs':"
+          echo "  - ci_sp.json       -> paste into repo Secret: AZURE_CREDENTIALS"
+          echo "  - backend-vars.txt -> create repo Variables: TFSTATE_RG, TFSTATE_SA, TFSTATE_CONTAINER, TFSTATE_KEY, INFRA_RG, LOCATION, AZ_SUBSCRIPTION_ID, AZ_TENANT_ID"
