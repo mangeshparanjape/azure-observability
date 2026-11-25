@@ -1,0 +1,10 @@
+// Merge into the existing Program.cs registrations, do not duplicate existing services.
+// The aggregate service invokes these check implementations directly; their AddCheck<T>()
+// registrations are optional unless other consumers use the framework HealthCheckService.
+services.AddHealthChecks();
+services.AddScoped<OrchestrationHealthCheckService>();
+services.AddScoped<CloudPaymentHealthCheck>();
+services.AddScoped<OnPremHealthCheck>();
+services.AddScoped<IHealthCheckAggregateService, HealthCheckAggregateService>();
+services.AddHttpClient("CloudPaymentHealth", client => client.Timeout = TimeSpan.FromSeconds(2));
+services.AddHttpClient("OnPremHealth", client => client.Timeout = TimeSpan.FromSeconds(2));
